@@ -1,0 +1,546 @@
+---
+title: "MATH 3910_Linear Regression Analysis"
+author: "Amanda Boschman, Anh Vo, and Camille Zaug"
+date: "6/12/2020"
+output: html_document
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(leaps)
+library(pls)
+library(glmnet)
+library(caret)
+
+```
+
+# Introduction
+We are investigating housing data. In this activity, we will wish to determine a model that predicts the response `SalePrice` (the price a home was sold for). This data contains variables describing many different aspects from a home, from the year it was built, the quality of its kitchen, and the type of paving in the driveway. In this document, we first investigate and process the data to prepare it for fitting. Then we use linear regression to produce different models. Finally, we determine the best one and predict on the Kaggle test data. 
+
+# Investigate Data
+
+```{r}
+train  <- data.frame(fread("home-data-for-ml-course/train.csv")) # Load in training data
+dim(train)
+```
+
+The training data has dimensions 1460x81. This means it has 80 predictors for the response `SalePrice`.
+
+```{r}
+attach(train)
+sapply(train,class)
+```
+
+This data has NAs, which are missing observations. Missing observations make it difficult to fit models on the data. Using the function `na.omit()` results in *all* of the values in the whole data set being removed, so instead we will make educated guesses about what these NAs should be. There are two types of data in this dataset: categorical and quantitative (see the summary below).
+
+For categorical variables, we replace NAs with mode (the most common value observed). For quantitative values, we replace NAs with mean (average value observed). 
+
+First, we separate the data by type.
+
+## Quantitative Data
+
+We create `ntrain`, a data frame with only quantitative data. 
+```{r}
+ntrain<-train[, sapply(train, class) != 'character']
+names(ntrain)
+```
+
+Now we will replace NAs with the mean.
+```{r}
+
+for (mm in 1:ncol(ntrain)){
+
+  ntrain[,mm]<-replace_na(ntrain[,mm],mean(ntrain[,mm]))
+  
+}
+
+# colSums(is.na(ntrain)) # Make sure there are no more NAs
+```
+
+## Categorical Data
+
+We create `ctrain`, a data frame with only categorical data. 
+```{r}
+ctrain<-train[, sapply(train, class) == 'character']
+names(ctrain)
+```
+
+
+Next, we reduce the number of categorical variables; some don't appear useful (if they had too many NAs or were too uniform). Below is a list of the predictors we try to keep:
+
+Potential factors:
+- MSZoning
+- LotShape
+- Neighborhood 
+- MasVnrType (some NAs)
+- ExterQual
+- Foundation
+- BsmtQual (some NAs)
+- BsmtExposure (some Nas)
+- BsmtFinType1 
+- KitchenQual
+- GarageType (some Nas)
+- GarageFinish (some Nas)
+
+Here are factors that did not seem useful (for having too many NAs or being too uniform):
+- Alley
+- Utilities
+- Street
+- LandContour
+- LotConfig 
+- LandSlope
+- Condition1 
+- Condition1
+- RoofStyle
+- BldgType
+- RoofMatl
+- BsmtCond 
+- BsmtFinType1
+- Heating
+- CentralAir
+- Electrical
+- Functional
+- GarageQual
+- GarageCond
+- PavedDrive
+- PoolQC
+- Fence
+- MiscFeature
+- SaleType
+- SaleCondition
+- FireplaceQu 
+- Exterior1st
+- Exterior2nd
+- HeatingQC
+- HouseStyle (level in Kaggle train but not in Kaggle test)
+
+Now we will reduce `ctrain` to only the categorical variables that appear to be useful in creating a model.
+```{r}
+
+# These variables below didn't have too many NAs and they weren't too uniform
+
+usefulones = c("MSZoning","LotShape","Neighborhood","MasVnrType","ExterQual","Foundation","BsmtQual","BsmtExposure","BsmtFinType1","KitchenQual","GarageType","GarageFinish")
+
+# Make the data in ctrain factors
+ctrain[] <- lapply(ctrain, factor) # the "[]" keeps the dataframe structure
+col_names <- names(ctrain)
+# do do it for some names in a vector named 'col_names'
+ctrain[col_names] <- lapply(ctrain[col_names] , factor)
+
+# Select only the preferred
+ctrain<- ctrain[,usefulones]
+
+ctrain  <- ctrain %>% mutate(Id = c(1:nrow(ctrain)))
+```
+
+Now we replace the NAs in the categorical data with the mode.
+```{r}
+for (mm in 1:ncol(ctrain)){
+
+  uniqx <- unique(ctrain[,mm])
+  md = uniqx[which.max(tabulate(match(ctrain[,mm], uniqx)))]
+  ctrain[,mm]<-replace_na(ctrain[,mm],md)
+  
+}
+
+# colSums(is.na(ctrain)) # Make sure there are no more NAs
+```
+
+## Merge categorical and quantitative data
+```{r}
+train_final <- data.frame(merge(ntrain,ctrain,by="Id"))
+
+dim(train_final)
+
+sapply(train_final,class) # Check that our data types are "numeric" and "factor"
+```
+
+# Fit the data
+
+We try a few methods to fit the data:
+
+1. Full fit
+
+2. Forwards and Backwards Subset Selection
+
+3. Principle Component Regression
+
+4. The Lasso 
+
+5. Ridge Regression
+
+## Create training data
+
+Take 80% of the data to be training data (chosen at random). The remaining 20% will be testing data.
+
+```{r}
+set.seed(10)
+train_final = na.omit(train_final) # This, in theory, should do nothing since we've removed all the NAs to begin with
+nnn= nrow(train_final)
+train_samp1 = sample(nnn,round(.8*nnn)) # Training data
+```
+
+## 1. Full fit
+
+There are many predictors in this method; the full fit model is very complicated as a result (and it will likely overfit). We perform this fit mainly to check that the data is correctly processed and may be fitted.
+
+```{r}
+full_fit <- lm(SalePrice~.,data=train_final[train_samp1,])
+summary(full_fit)
+```
+
+From this summary, we can see that there are many significant predictors, even though most are not significant. There are also some coefficients undefined due to singularities, which is not useful. But the fact that there are some significant predictors means that the data set can actually help us the answer the question "What predicts a house's sale price?". 
+
+Below, we plot the residuals to see if we are taking into account the variance correctly. While there is some curved structure to the residuals plot, it is relatively constant, which means we are capturing the main structure of the training data. Later, we produce similar plots to see how well the models do at capturing the structure of the test data.
+
+```{r}
+plot(SalePrice[train_samp1],resid(full_fit),xlab="Sale Price",ylab="Residuals")
+```
+
+Finally, we find the error of the testing data.
+```{r}
+full_pred = predict(full_fit,train_final[-train_samp1,],interval = "none")
+
+error1 = sqrt(sum(full_pred-train_final[-train_samp1,]$SalePrice)^2)
+error1
+```
+
+
+# Forward and Backward Stepwise Subset Selection
+
+Here, we first perform subset selection using the forward stepwise method. Then we apply backward stepwise.
+```{r}
+regfit_fwd = regsubsets(SalePrice ~ . , data = train_final[train_samp1,],method="forward",nvmax=ncol(train_final)) 
+
+fwd_summary = summary(regfit_fwd)
+
+###########
+
+regfit_bwd = regsubsets(SalePrice ~ . , data = train_final[train_samp1,],method="backward",nvmax=ncol(train_final)) 
+
+bwd_summary = summary(regfit_bwd)
+
+```
+
+Using the BIC, Cp, and adjusted $R^2$, we find the number of predictors in each method that produces the best result (minimizes BIC and Cp, maximizes adjusted $R^2$.)
+
+```{r}
+par(mfrow = c(3,2))
+plot(fwd_summary$cp,type = "b",xlab = "Number of variables",ylab = "Cp")
+ind_cp = which.min(fwd_summary$cp)
+points(ind_cp, fwd_summary$cp[ind_cp],col = "red",pch = 20)
+
+plot(fwd_summary$bic,type = "b",xlab = "Number of variables",ylab = "BIC")
+ind_bic = which.min(fwd_summary$bic)
+points(ind_bic, fwd_summary$bic[ind_bic],col = "red",pch = 20)
+
+plot(fwd_summary$adjr2,type = "b",xlab = "Number of variables",ylab = "Adjusted R2")
+ind_adjr2 = which.max(fwd_summary$adjr2)
+points(ind_adjr2, fwd_summary$adjr2[ind_adjr2],col = "red",pch = 20)
+
+######## 
+
+
+
+plot(bwd_summary$cp,type = "b",xlab = "Number of variables",ylab = "Cp")
+ind_cp = which.min(bwd_summary$cp)
+points(ind_cp, bwd_summary$cp[ind_cp],col = "red",pch = 20)
+
+plot(bwd_summary$bic,type = "b",xlab = "Number of variables",ylab = "BIC")
+ind_bic = which.min(bwd_summary$bic)
+points(ind_bic, bwd_summary$bic[ind_bic],col = "red",pch = 20)
+
+plot(bwd_summary$adjr2,type = "b",xlab = "Number of variables",ylab = "Adjusted R2")
+ind_adjr2 = which.max(bwd_summary$adjr2)
+points(ind_adjr2, bwd_summary$adjr2[ind_adjr2],col = "red",pch = 20)
+
+
+```
+
+
+The best model with the fewest predictors seems to include about 25 predictors (this comes from backward stepwise using the BIC measure, which most heavily penalizes large coefficients). We will create a fit with this model.
+
+```{r}
+bwdchoice = names(coef(regfit_bwd, 25))[-1]
+bwdchoice
+```
+
+Now fit on the subsets found via this method and produce a summary. 
+```{r}
+# Exterior1st didn't work: new levels
+bwd_fit <- lm(SalePrice~MSSubClass+LotArea+OverallQual+OverallCond+YearBuilt+BsmtFinSF1+BsmtUnfSF+X2ndFlrSF+LowQualFinSF+TotRmsAbvGrd+Fireplaces+WoodDeckSF+MoSold+Neighborhood+ExterQual+Foundation+BsmtQual+BsmtExposure+BsmtFinType1+KitchenQual+GarageType, data = train_final[train_samp1,])
+
+summary(bwd_fit)
+```
+There are now many significant predictors (there are also no NAs found for coefficients, which was an issue in the full fit).
+
+Finally, we predict on the test data and find the error.
+```{r}
+
+bwd_pred = predict(bwd_fit,train_final[-train_samp1,],interval = "none")
+
+error2 = sqrt(sum(bwd_pred-train_final[-train_samp1,]$SalePrice)^2)
+error2
+
+```
+
+# Principal Component Regression
+
+Principal component regression only works on quantitative variables, not categorical ones. It works by finding linear combinations of predictors (components) that maximizes the variance of the data, then performs regular least-squares linear regression on the components. We fit on `ntrain` only, since that is the data frame with the quantitative predictors.
+
+First, we generate the random training (and testing) data from `ntrain`.
+```{r}
+ntrain = na.omit(ntrain) # Should omit nothing since we already removed NAs
+n= nrow(ntrain)
+train_samp = sample(n,round(.8*n))
+```
+
+Perform the fit.
+```{r}
+pcr_fit = pcr(SalePrice~.,data=ntrain, scale=TRUE,validation = "CV", subset = train_samp)
+```
+
+Produce the validation plot. This shows the error against the number of components used.
+```{r}
+validationplot(pcr_fit,val.type = "RMSEP")
+```
+
+We see that the error drops significantly at the inclusion of one component, then gradually increases with the introduction of more. From the plot, 5 seems like a good number of components to include. It is a simple model that produces a relatively low error.
+
+Finally, we fit and get the error produced when using 5 components.
+```{r}
+
+#Prepare data; must be a matrix for this model
+x = model.matrix(SalePrice~.,ntrain)[,-1]
+index <- match("SalePrice", names(ntrain))
+y=ntrain[,index]
+
+# predict
+pcr_pred = predict(pcr_fit,x[-train_samp,],ncomp = 5)  #pick the number of components
+
+# Get the error
+error3 = sqrt(sum((pcr_pred-y[-train_samp])^2))
+error3
+
+```
+
+# The Lasso
+
+The lasso uses a modified version of least squares regression; it penalizes large predictors and can set some predictors to 0. Here, we use the lasso with cross-validation. We fit on the training data, predict on the test data, and get the test error. We use the best value of $\lambda$ (the one that minimizes test error) to perform our final fit.
+
+First, we reset our model matrix to include the categorical variables as well.
+```{r}
+#Prepare data; must be a matrix for this model
+x = model.matrix(SalePrice~.,train_final)[,-1]
+index <- match("SalePrice", names(train_final))
+y=train_final[,index]
+```
+
+Here, we apply the lasso and plot the error each value of $\lambda$ produces.
+```{r}
+cv_lasso = cv.glmnet(x[train_samp,],y[train_samp],alpha = 1)
+
+plot(cv_lasso)
+```
+
+Finally, we fit using the best value of $\lambda$ and produce the test error.
+```{r}
+best_lam = cv_lasso$lambda.min
+
+lasso_mod = glmnet(x[train_samp,],y[train_samp],alpha = 1,lambda = best_lam) # alpha = 0 gives ridge regression
+
+lasso_pred = predict(lasso_mod,s = best_lam, newx = x[-train_samp,])
+
+error4 <- sqrt(sum((lasso_pred-y[-train_samp])^2))
+error4
+```
+
+# Ridge Regression
+
+Ridge regression also uses a modified version of least squares regression (though the penalty is different than the lasso's penalty); it penalizes large predictors and but cannot set some predictors to 0. Here, we use ridge regression with cross-validation. We fit on the training data, predict on the test data, and get the test error. We use the best value of $\lambda$ (the one that minimizes test error) to perform our final fit.
+
+
+Here, we apply ridge regression and plot the error each value of $\lambda$ produces.
+```{r}
+cv_ridge = cv.glmnet(x[train_samp,],y[train_samp],alpha = 0)
+
+plot(cv_ridge)
+```
+
+We use the best value of $\lambda$ to fit and produce test error.
+```{r}
+best_lam = cv_ridge$lambda.min
+
+ridge_mod = glmnet(x[train_samp,],y[train_samp],alpha = 0,lambda = best_lam) # alpha = 0 gives ridge regression
+
+ridge_pred = predict(ridge_mod,s = best_lam, newx = x[-train_samp,])
+
+error5 <- sqrt(sum((ridge_pred-y[-train_samp])^2))
+error5
+```
+
+
+# Conclusion
+
+These are the errors produced by each model.
+```{r}
+# Full fit, backwards stepwise, PCR, Lasso, Ridge Regression
+error_list = c(error1, error2, error3, error4, error5)
+error_list
+```
+
+To further assess the fit of each model, we can plot the errors against the true value of `SalePrice` for the testing data. Models that produce errors constant and near 0 are more effective.
+```{r}
+par(mfrow = c(2,3))
+plot(SalePrice[-train_samp],full_pred-SalePrice[-train_samp],xlab="Sale Price",ylab="Full Fit Test Error")
+plot(SalePrice[-train_samp],bwd_pred-SalePrice[-train_samp],xlab="Sale Price",ylab="Backwards Stepwise Test Error")
+plot(y[-train_samp],pcr_pred-y[-train_samp],xlab="Sale Price",ylab="PCR Test Error")
+plot(y[-train_samp],ridge_pred-y[-train_samp],xlab="Sale Price",ylab="Ridge Regression Test Error")
+plot(y[-train_samp],lasso_pred-y[-train_samp],xlab="Sale Price",ylab="Lasso Test Error")
+
+```
+
+From the plots of error, it is clear that the full fit and the backwards stepwise fit missed structure in the data, resulting in relatively high errors. PCR produced smaller error, but there is still some structure to the error plot. Ridge regression and the lasso captured the most structure, and therefore produced the smallest error. In summary, ridge regression is the best model for this data.
+
+## Kaggle Prediction
+
+Now that we have our best model, we will test on the Kaggle testing data. 
+
+```{r}
+test <- data.frame(fread("home-data-for-ml-course/test.csv")) # Load in testing data
+dim(test)
+```
+
+Now process the data to remove NAs in the same way we processed the training data. 
+
+We create `ntrain`, a data frame with only quantitative data. 
+```{r}
+ntest<-test[, sapply(test, class) != 'character']
+names(ntest)
+```
+
+
+Now we will replace NAs with the mean.
+```{r}
+for (mm in 1:ncol(ntest)){
+  ntest[,mm]<-replace_na(ntest[,mm],mean(na.omit(ntest[,mm])))
+}
+
+#colSums(is.na(ntest)) # Make sure there are no more NAs
+```
+
+`ctrain` is created with only categorical data.
+```{r}
+ctest<-test[, sapply(test, class) == 'character']
+names(ctest)
+```
+
+We cut down the variables to those deemed useful earlier.
+```{r}
+
+# These variables below didn't have too many NAs and they weren't too uniform
+
+usefulones = c("MSZoning","LotShape","Neighborhood","MasVnrType","ExterQual","Foundation","BsmtQual","BsmtExposure","BsmtFinType1","KitchenQual","GarageType","GarageFinish")
+
+# Make the data in ctrain factors
+ctest[] <- lapply(ctest, factor) # the "[]" keeps the dataframe structure
+col_names <- names(ctest)
+# do do it for some names in a vector named 'col_names'
+ctest[col_names] <- lapply(ctest[col_names] , factor)
+
+# Select only the preferred
+ctest<- ctest[,usefulones]
+
+ctest  <- ctest %>% mutate(Id = ntest$Id)
+```
+
+
+Now we replace the NAs in the categorical data with the mode.
+```{r}
+for (mm in 1:ncol(ctest)){
+
+  uniqx <- unique(ctest[,mm])
+  uniqx
+  md = uniqx[which.max(tabulate(match(ctest[,mm], uniqx)))]
+  ctest[,mm]<-replace_na(ctest[,mm],md)
+  
+}
+
+#colSums(is.na(ctest)) # Make sure there are no more NAs
+
+```
+
+Finally, merge the data.
+```{r}
+test_final <- data.frame(merge(ntest,ctest,by="Id"))
+dim(test_final)
+
+sapply(test_final,class) # Check that our data types are "numeric" and "factor"
+```
+
+Perform the prediction using ridge regression, our best model.
+```{r}
+x_test = model.matrix(~.,test_final)[,-1]
+ridge_pred_test = predict(ridge_mod,s = best_lam, newx = x_test)
+mean(ridge_pred_test)
+mean(SalePrice)
+```
+
+This mean sale price predicted by our model on the testing data is about 177,000 dollars, while the average sale price from the training data is 181,000 dollars. This is not bad!
+
+Now we create our prediction file to submit to Kaggle.
+```{r}
+
+final_pred = data.frame(test_final$Id, ridge_pred_test)
+
+names(final_pred)<-c("Id", "SalePrice")
+
+
+write.csv(final_pred,"Regression_Prediction.csv",row.names=FALSE)
+```
+
+18973 is our Kaggle score from this prediction, which we are happy with! This puts us around 20,000th place.
+
+Here is how we compare to the Kaggle leaderboard.
+
+```{r}
+leaderboard<-read.csv("home-data-for-ml-course-publicleaderboard.csv")
+```
+
+We did slightly worse than the average score:
+```{r}
+mean(leaderboard$Score)
+```
+
+
+```{r}
+# Remove outliers
+outliers <- boxplot(leaderboard$Score, plot=FALSE)$out
+leaderboard<-leaderboard[-which(leaderboard$Score %in% outliers),]
+```
+
+
+Here are plots visualizing how the scores are distributed (with outliers removed).
+
+The red bar/point shows how our team's score compares to that of the leaderboard.
+```{r}
+library(ggplot2)
+par(mfrow = c(2,1))
+# Histogram
+ggplot(leaderboard, aes(x=Score)) + geom_histogram(bins = 100)+geom_vline(xintercept=18973,color = "red")
+
+
+#Boxplot
+ggplot(leaderboard, aes(y=Score)) + 
+  geom_boxplot()+ theme_bw()+geom_point(aes(x=0,y=18973),color = "red")+theme(axis.text.x=element_blank())
+```
+
